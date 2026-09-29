@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 引擎/工具运行时产物(不应进仓库) ----
+projz/
+logs/
+tmp/
+*.db
+*.rpa
+*.rpyc
+*.rpymc
+
+# ---- 翻译工作区(含游戏语料与译文，绝不入库) ----
+workspace/
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,14 @@
+# .bat must stay CRLF + ASCII: cmd.exe parses them with the system ANSI
+# codepage, and UTF-8 Chinese text corrupts the parser. Keep it that way.
+*.bat text eol=crlf
+
+# Python and docs are UTF-8; normalize to LF in the repository.
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+
+# Vendored third-party code keeps its own upstream bytes: no line-ending
+# rewriting, no encoding sniffing. Local edits to it go through the official
+# upstream repositories, not here.
+vendor/** -text

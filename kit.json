@@ -1,0 +1,7 @@
+{
+  "tool_dir": "../projz_renpy_translation",
+  "workspace": "../workspace",
+  "target_language": "schinese",
+  "export_limit": 0,
+  "open_folder_after_export": true
+}

@@ -1,0 +1,746 @@
+"""拖拽工具包的核心驱动。
+
+用法（由 翻译.bat 调用）:
+    kit.py <游戏目录>      -> 导出全部未翻译文本
+    kit.py <JSON 文件>     -> 把译文装回游戏
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import traceback
+
+KIT_DIR = os.path.dirname(os.path.abspath(__file__))
+VENDOR_DIR = os.path.join(KIT_DIR, 'vendor')
+UNREN = os.path.join(VENDOR_DIR, 'unren', 'unrpyc.py')
+
+SCRIPT_EXTS_RE = re.compile(r'\.(rpy|rpyc|rpym|rpymc)$', re.IGNORECASE)
+
+OK = '  [OK]   '
+NO = '  [失败] '
+GO = '  ...   '
+
+
+# ---------------------------------------------------------------- 输出工具
+
+def info(msg):
+    print(f'{GO}{msg}')
+
+
+def ok(msg):
+    print(f'{OK}{msg}')
+
+
+def fail(msg):
+    print(f'{NO}{msg}')
+
+
+def banner(msg):
+    print()
+    print('=' * 64)
+    print(f'  {msg}')
+    print('=' * 64)
+
+
+def die(msg, hint=None):
+    print()
+    fail(msg)
+    if hint:
+        print()
+        for line in hint.strip().splitlines():
+            print(f'         {line.strip()}')
+    print()
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- 配置
+
+DEFAULT_CONFIG = {
+    'tool_dir': '../projz_renpy_translation',
+    'workspace': '../workspace',
+    'target_language': 'schinese',
+    'export_limit': 0,
+    'open_folder_after_export': True,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.path.join(KIT_DIR, 'kit.json')
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            die(f'配置文件 kit.json 读取失败: {e}',
+                '请检查它的格式是否正确(JSON),或直接删掉它使用默认配置。')
+    cfg['tool_dir'] = os.path.normpath(os.path.join(KIT_DIR, cfg['tool_dir']))
+    cfg['workspace'] = os.path.normpath(os.path.join(KIT_DIR, cfg['workspace']))
+    return cfg
+
+
+# ---------------------------------------------------------------- 工具接入
+
+def enter_tool_dir(cfg):
+    """工具内部用的是相对路径('./projz'),必须站在它自己的目录里运行。"""
+    tool_dir = cfg['tool_dir']
+    if not os.path.isdir(tool_dir):
+        die(f'找不到翻译工具本体: {tool_dir}',
+            '请确认 projz_renpy_translation 和 renpy_translate_kit 在同一个目录下。')
+    os.chdir(tool_dir)
+    sys.path.insert(0, tool_dir)
+
+
+def import_tool():
+    try:
+        import log  # noqa: F401  启用工具的日志
+        from command.manage import execute_cmd, exists_cmd  # noqa: F401
+        from store import TranslationIndex
+        from injection.renpy import check_renpy_dir, check_project_name
+        return {
+            'execute_cmd': execute_cmd,
+            'exists_cmd': exists_cmd,
+            'TranslationIndex': TranslationIndex,
+            'check_renpy_dir': check_renpy_dir,
+            'check_project_name': check_project_name,
+        }
+    except Exception as e:
+        die(f'翻译工具加载失败: {e}',
+            '这通常表示依赖没装全，或 projz_renpy_translation 目录不完整。\n'
+            '完整报错:\n' + traceback.format_exc())
+
+
+def run_command(tool, cmd, args, what):
+    """执行工具内部命令;返回 True/False。"""
+    try:
+        tool['execute_cmd'](cmd, args)
+        return True
+    except AssertionError as e:
+        fail(f'{what}失败: {e}')
+        return False
+    except Exception as e:
+        fail(f'{what}出错: {e}')
+        print(traceback.format_exc())
+        return False
+
+
+# ---------------------------------------------------------------- 游戏目录检查
+
+def validate_game_dir(path):
+    """确认拖进来的是 RenPy 游戏根目录(含 exe 的那一层)。"""
+    if not os.path.isdir(path):
+        die(f'这不是一个目录: {path}')
+    path = os.path.abspath(path)
+
+    base = os.path.basename(path)
+    if base.lower() in ('game', 'lib', 'renpy'):
+        die(f'你拖的是 "{base}" 子目录,不是游戏根目录。',
+            f'请拖它上面一层,也就是含 exe 的那一层:\n{os.path.dirname(path)}')
+
+    for d in ('game', 'lib', 'renpy'):
+        if not os.path.isdir(os.path.join(path, d)):
+            die(f'这个目录不像 RenPy 游戏: 缺少 "{d}" 目录。',
+                f'当前目录: {path}\n'
+                '请拖含游戏 exe 的那一层(里面应该能看到 game、lib、renpy 三个目录)。')
+
+    exes = [f for f in os.listdir(path) if f.lower().endswith('.exe')]
+    if not exes:
+        die('这个游戏目录里没有 exe 文件,无法识别入口。',
+            f'当前目录: {path}')
+    return path
+
+
+# ---------------------------------------------------------------- 解包检查与自动解包
+
+def find_rpa_files(game_dir):
+    found = []
+    for root, dirs, files in os.walk(game_dir):
+        dirs[:] = [d for d in dirs if d.lower() not in ('lib', 'renpy', 'projz')]
+        for f in files:
+            if f.lower().endswith('.rpa'):
+                found.append(os.path.join(root, f))
+    return found
+
+
+def find_undecoded_rpyc(game_dir):
+    """找出还没还原成明文脚本的 .rpyc/.rpymc。
+
+    .rpymc 反编译出来是 .rpym(不是 .rpy),所以配对时按各自的扩展名查,
+    否则刚解好的 .rpym 会被当成"还没解"而反复重解。
+    """
+    game_sub = os.path.join(game_dir, 'game')
+    found = []
+    for root, dirs, files in os.walk(game_sub):
+        names = {f.lower() for f in files}
+        for f in files:
+            low = f.lower()
+            if low.endswith('.rpymc'):
+                src_ext = '.rpym'
+            elif low.endswith('.rpyc'):
+                src_ext = '.rpy'
+            else:
+                continue
+            stem = f.rsplit('.', 1)[0].lower()
+            if f'{stem}{src_ext}' not in names:
+                found.append(os.path.join(root, f))
+    return found
+
+
+def archive_missing_entries(archive, game_dir):
+    """列出压缩包里在游戏目录中还不存在的文件(相对游戏根目录)。"""
+    env = dict(os.environ)
+    env['PYTHONPATH'] = VENDOR_DIR
+    env['PYTHONIOENCODING'] = 'utf-8'
+    cmd = [sys.executable, '-m', 'unrpa', '-l', archive]
+    p = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                       errors='replace', encoding='utf-8')
+    if p.returncode != 0:
+        return None  # 读不了这个包,交给解包流程去报错
+    entries = []
+    for line in (p.stdout or '').splitlines():
+        line = line.strip().replace('/', os.sep)
+        if not line or line.startswith(('Extracting', 'Archive', '--')):
+            continue
+        if not line.lower().endswith(('.rpy', '.rpyc', '.rpym', '.rpymc')):
+            continue
+        if not os.path.exists(os.path.join(game_dir, line)):
+            entries.append(line)
+    return entries
+
+
+def check_unpacked(game_dir):
+    """返回 (是否已解包, 原因说明)。
+
+    只有"包里有东西在游戏目录里看不见"才算未解包 —— 已经解过的包不再重复解,
+    否则会覆盖后面生成到 game/tl/ 里的译文。
+    """
+    need_rpa = []
+    for rpa in find_rpa_files(game_dir):
+        missing = archive_missing_entries(rpa, game_dir)
+        if missing:
+            need_rpa.append((rpa, len(missing)))
+    if need_rpa:
+        return False, f'游戏里还有 {len(need_rpa)} 个 .rpa 包没解开'
+
+    rpycs = find_undecoded_rpyc(game_dir)
+    if rpycs:
+        return False, f'有 {len(rpycs)} 个 .rpyc 还没有还原成 .rpy'
+    return True, ''
+
+
+def extract_rpa(archive, game_dir):
+    """解压到临时目录,只把缺失的脚本文件补进游戏目录(不覆盖、不解图片音频)。
+
+    游戏本身能直接读 .rpa 里的图片和音频,只有文本需要落成 .rpy 才扫得到;
+    全量解压会让游戏体积翻倍,没必要。
+    """
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='kit_unrpa_')
+    try:
+        env = dict(os.environ)
+        env['PYTHONPATH'] = VENDOR_DIR
+        env['PYTHONIOENCODING'] = 'utf-8'
+        cmd = [sys.executable, '-m', 'unrpa', '-m', '--continue-on-error',
+               '-p', tmp, archive]
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                           errors='replace', encoding='utf-8')
+        out = (p.stdout or '') + (p.stderr or '')
+
+        copied = 0
+        for root, dirs, files in os.walk(tmp):
+            for f in files:
+                if not SCRIPT_EXTS_RE.search(f):
+                    continue
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, tmp)
+                dst = os.path.join(game_dir, rel)
+                if os.path.exists(dst):
+                    continue  # 已存在的一律不动
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+        return copied, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_unrpyc(targets):
+    cmd = [sys.executable, UNREN, '--clobber', '-p', '4'] + targets
+    p = subprocess.run(cmd, capture_output=True, text=True,
+                       errors='replace', encoding='utf-8', cwd=os.path.dirname(UNREN))
+    return p.returncode == 0, (p.stdout or '') + (p.stderr or '')
+
+
+def auto_unpack(game_dir, reason):
+    """自动解包:先解 rpa,再把 rpyc 反编译回 rpy。"""
+    banner('这个游戏还没解包，正在自动解包')
+    info(f'原因: {reason}')
+    print()
+
+    rpas = find_rpa_files(game_dir)
+    if rpas:
+        info(f'步骤 1/2  解开 {len(rpas)} 个 .rpa 压缩包')
+        last_out = ''
+        for i, rpa in enumerate(rpas, 1):
+            print(f'         [{i}/{len(rpas)}] {os.path.basename(rpa)}')
+            _, last_out = extract_rpa(rpa, game_dir)
+        # 解没解开不看返回值, 直接看包里的脚本还在不在游戏目录里
+        still = [(r, archive_missing_entries(r, game_dir)) for r in rpas]
+        still = [(r, m) for r, m in still if m]
+        if still:
+            print(last_out[-2000:] if last_out else '')
+            die(f'还有 {len(still)} 个压缩包没能解开。',
+                '这个包可能加了密或损坏。请改用 UnRen 手动解包:\n'
+                'https://github.com/VepsrP/UnRen-Gideon-mod-/releases\n'
+                '下载 UnRen-forall.bat 放进游戏目录,双击后按 回车 → 8 → 回车 → y')
+        ok(f'{len(rpas)} 个压缩包已解开')
+
+    rpycs = find_undecoded_rpyc(game_dir)
+    if rpycs:
+        info(f'步骤 2/2  把 {len(rpycs)} 个 .rpyc 还原成 .rpy')
+        good, out = run_unrpyc(rpycs)
+        still = find_undecoded_rpyc(game_dir)
+        if still:
+            print(out[-2000:] if out else '')
+            die(f'还有 {len(still)} 个文件没能还原。',
+                '这个游戏可能用了较老或加了混淆的 RenPy 版本。\n'
+                '请改用 UnRen 手动解包:\n'
+                'https://github.com/VepsrP/UnRen-Gideon-mod-/releases\n'
+                '下载 UnRen-forall.bat 放进游戏目录,双击后按 回车 → 8 → 回车 → y')
+        ok(f'{len(rpycs)} 个文件已还原')
+
+    print()
+    ok('解包完成')
+
+
+# ---------------------------------------------------------------- 工作区
+
+def safe_name(name):
+    return re.sub(r'[<>:"/\\|?*]', '_', name).strip() or 'game'
+
+
+def game_workspace(cfg, game_path):
+    ws = os.path.join(cfg['workspace'], safe_name(os.path.basename(game_path)))
+    os.makedirs(os.path.join(ws, '待翻译'), exist_ok=True)
+    return ws
+
+
+def read_manifest(ws):
+    path = os.path.join(ws, 'manifest.json')
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def write_manifest(ws, data):
+    with open(os.path.join(ws, 'manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------- 索引
+
+def norm(p):
+    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+
+def find_index(tool, game_path):
+    """按游戏路径找已有的索引。"""
+    for doc_id, index in tool['TranslationIndex'].list_indexes():
+        try:
+            if norm(index.project_path) == norm(game_path):
+                return doc_id, index
+        except Exception:
+            continue
+    return None, None
+
+
+def make_nickname(game_path):
+    """给游戏起一个索引名。
+
+    英文目录名直接用; 中文/日文等非 ASCII 目录名会被清成空或只剩一两个字,
+    这时补一小段路径哈希,避免不同游戏撞成同一个索引名而互相顶掉。
+    同一路径始终得到同一个名字,所以重复拖入能认出旧索引。
+    """
+    base = safe_name(os.path.basename(game_path))
+    nick = re.sub(r'[^0-9A-Za-z_\-]', '', base)[:24]
+    if len(nick) < 3:
+        import hashlib
+        digest = hashlib.md5(os.path.normcase(os.path.abspath(game_path)).encode('utf-8'))
+        nick = (nick or 'game') + digest.hexdigest()[:8]
+    return nick
+
+
+def ensure_base_injection(tool, index):
+    """确认游戏里装着工具需要的支持脚本,缺了就补上。
+
+    工具在生成/导入译文时要靠这份小脚本驱动游戏读文本。用「去掉汉化」
+    还原过之后它会被删掉,游戏的索引状态也变成「未注入」,这时再翻译同一个
+    游戏就会在这一步失败,所以每次开始前先检查一遍。
+    """
+    if index.project.get_injection_state('Base'):
+        return
+    print()
+    info('游戏里缺少工具需要的支持脚本(做过还原的游戏是这个状态),正在补上')
+    if not run_command(tool, 'ij', f'{index.nickname} -t Base', '安装翻译支持'):
+        die('安装翻译支持失败。',
+            '请确认游戏目录完整,游戏当前没有在运行,然后重试。')
+    # 命令把状态写进了索引库, 手里这个对象还是旧的, 同步一下免得后续判断出错
+    index.project.set_injection_state('Base', True)
+    ok('翻译支持已就绪')
+
+
+def ensure_index(tool, cfg, game_path, ws):
+    """没有索引就建一个(会启动一次游戏)。"""
+    doc_id, index = find_index(tool, game_path)
+    if index is not None:
+        ok(f'已有翻译索引: {index.nickname}:{index.tag}')
+        ensure_base_injection(tool, index)
+        return index
+
+    nick = make_nickname(game_path)
+    info(f'第一次处理这个游戏，正在建立翻译索引 "{nick}"')
+    info('(这一步会启动游戏一次，让游戏自己报告文本清单，窗口弹出后会自动关闭)')
+    print()
+    if not run_command(tool, 'new', f'"{game_path}" -n {nick}', '建立索引'):
+        die('建立索引失败。',
+            '请确认这个游戏能正常启动，且目录骨架完整(game/lib/renpy 都在)。')
+    print()
+    doc_id, index = find_index(tool, game_path)
+    if index is None:
+        die('索引建立后没能读回来，请重试。')
+    ok(f'索引已建立: {index.nickname}:{index.tag}')
+    return index
+
+
+def ensure_lang(tool, index, lang):
+    """没导入这个语言就导入一次(会启动一次游戏)。"""
+    if index.exists_lang(lang):
+        ok(f'语言 "{lang}" 已就绪')
+        return
+    info(f'第一次使用语言 "{lang}"，正在读取游戏里的文本')
+    info('(这一步会启动游戏一次，窗口弹出后会自动关闭)')
+    print()
+    if not run_command(tool, 'i', f'{index.nickname} -l {lang}', '导入语言'):
+        die(f'导入语言 "{lang}" 失败。')
+    print()
+    ok(f'语言 "{lang}" 已就绪')
+
+
+def remaining_counts(tool, index, lang):
+    """返回 (已翻译, 未翻译)。
+
+    每次都从数据库重新取,因为写译文(lj)之后 stats 已经被更新到 DB,
+    而手里这个 index 对象还是旧的,直接读它会报出过期的进度。
+    """
+    fresh = None
+    try:
+        fresh = tool['TranslationIndex'].from_docid_or_nickname(
+            doc_id=index.doc_id, nickname=index.nickname)
+    except Exception:
+        fresh = None
+    stats = (fresh or index).translation_state
+    trans = untrans = 0
+    for kind in ('dialogue', 'string'):
+        entry = stats.get(kind, {}).get(lang)
+        if entry:
+            trans += entry[0]
+            untrans += entry[1]
+    return trans, untrans
+
+
+# ---------------------------------------------------------------- 导出
+
+def build_export_args(nickname, lang, out_file, limit=0):
+    """拼导出命令。
+
+    limit 为 0(或没配)时不带 --limit,工具就会导出全部未翻译文本;
+    只有显式配成 2 以上的行数才限行(工具本身要求 --limit 至少为 2)。
+    """
+    try:
+        limit = int(limit or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    args = f'{nickname} -l {lang} -f "{out_file}" -nw'
+    if limit > 1:
+        args += f' --limit {limit}'
+    return args
+
+
+def do_export(tool, cfg, game_path):
+    lang = cfg['target_language']
+    limit = cfg.get('export_limit', 0)
+    ws = game_workspace(cfg, game_path)
+    manifest = read_manifest(ws)
+
+    banner(f'导出未翻译文本: {os.path.basename(game_path)}')
+
+    unpacked, reason = check_unpacked(game_path)
+    if not unpacked:
+        auto_unpack(game_path, reason)
+    else:
+        ok('游戏已解包')
+
+    index = ensure_index(tool, cfg, game_path, ws)
+    ensure_lang(tool, index, lang)
+
+    trans, untrans = remaining_counts(tool, index, lang)
+    print()
+    info(f'当前进度: 已翻译 {trans} 行, 未翻译 {untrans} 行')
+
+    batch_no = int(manifest.get('batch', 0)) + 1
+    out_dir = os.path.join(ws, '待翻译')
+    name = f'{safe_name(os.path.basename(game_path))}_{lang}_{batch_no:03d}.json'
+    out_file = os.path.join(out_dir, name)
+
+    banner('正在导出')
+    ok_flag = run_command(
+        tool, 'sj',
+        build_export_args(index.nickname, lang, out_file, limit),
+        '导出')
+    if not ok_flag:
+        die('导出失败。')
+
+    if not os.path.isfile(out_file):
+        print()
+        ok('没有未翻译的文本了 —— 这个游戏该翻的都翻完了。')
+        print()
+        info('如果游戏里还看到英文，可能是这些情况:')
+        print('         - 那些文本在图片里(不是文本,翻译不了)')
+        print('         - 那些文本在脚本里被标记为无需翻译')
+        print()
+        return
+
+    with open(out_file, encoding='utf-8') as f:
+        count = len(json.load(f))
+
+    if count == 0:
+        os.remove(out_file)
+        print()
+        ok('没有未翻译的文本了 —— 这个游戏该翻的都翻完了。')
+        print()
+        return
+
+    manifest.update({
+        'game_path': game_path,
+        'game_name': os.path.basename(game_path),
+        'nickname': index.nickname,
+        'tag': index.tag,
+        'lang': lang,
+        'batch': batch_no,
+    })
+    write_manifest(ws, manifest)
+
+    print()
+    banner('导出完成')
+    ok(f'行数: {count} 行')
+    ok(f'文件: {out_file}')
+    print()
+    print('  接下来把下面这个文件整个丢给对话，让它翻译:')
+    print()
+    print(f'      {out_file}')
+    print()
+    print('  翻的时候可以连 翻译提示词.md 的第一段一起发，它会先写翻译任务书再动笔，')
+    print('  翻出来的语气和术语更统一。')
+    print()
+    print('  翻好后，把翻译好的 JSON 拖到 翻译.bat 上，就会自动装回游戏。')
+    print()
+
+    if cfg.get('open_folder_after_export', True):
+        try:
+            subprocess.Popen(['explorer', '/select,', out_file])
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- 回填
+
+def load_json_file(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        die(f'这个 JSON 读不了: {e}',
+            '请确认拖进来的是一份翻译好的待翻译文件(JSON 格式)。')
+    if not isinstance(data, dict) or not data:
+        die('这个 JSON 的内容不是预期的格式。',
+            '待翻译文件应该是一个 {编号: 原文} 的 JSON 对象。')
+    return data
+
+
+def locate_game_for_file(tool, cfg, json_path, data):
+    """先按工作区认领,认不出就用 tid 在所有索引里比对。"""
+    parent = os.path.dirname(os.path.abspath(json_path))
+    for _ in range(4):
+        manifest = read_manifest(parent) if os.path.isfile(
+            os.path.join(parent, 'manifest.json')) else None
+        if manifest and manifest.get('game_path'):
+            game_path = manifest['game_path']
+            if os.path.isdir(game_path):
+                return game_path, manifest
+            die(f'这份文件属于游戏 "{manifest.get("game_name")}"，但它的目录已经不在了。',
+                f'记录的位置: {game_path}')
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+
+    info('正在识别这份文件属于哪个游戏...')
+    tids = [t for t in data.keys() if isinstance(t, str)]
+    best, best_score = None, 0
+    for doc_id, index in tool['TranslationIndex'].list_indexes():
+        try:
+            lang = index.translation_state
+            for kind in ('dialogue', 'string'):
+                for lg in lang.get(kind, {}):
+                    tids_known = index.get_untranslated_lines(lg, say_only=False)
+                    tids_known += index.get_translated_lines(lg, say_only=False)
+                    known = {t for t, _ in tids_known}
+                    score = sum(1 for t in tids if t in known)
+                    if score > best_score:
+                        best, best_score = (index.project_path, lg), score
+        except Exception:
+            continue
+
+    if best and best_score >= max(1, len(tids) // 2):
+        ok(f'识别为: {os.path.basename(best[0])} (语言 {best[1]})')
+        return best[0], {'lang': best[1]}
+
+    die('认不出这份文件属于哪个游戏。',
+        '请把待翻译文件放在它自己的工作区目录里直接翻译,\n'
+        '或者确认这个游戏已经用本工具导出过一次。')
+
+
+def do_apply(tool, cfg, json_path):
+    data = load_json_file(json_path)
+    game_path, manifest = locate_game_for_file(tool, cfg, json_path, data)
+    lang = manifest.get('lang') or cfg['target_language']
+
+    banner(f'装回游戏: {os.path.basename(game_path)}')
+
+    doc_id, index = find_index(tool, game_path)
+    if index is None:
+        die('这个游戏还没有翻译索引。',
+            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
+
+    ok(f'索引: {index.nickname}:{index.tag}   语言: {lang}')
+    if not index.exists_lang(lang):
+        die(f'索引里没有语言 "{lang}"。',
+            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
+
+    # 还原过的游戏会缺少支持脚本,先补上再写译文
+    ensure_base_injection(tool, index)
+
+    print()
+    info(f'正在写入 {len(data)} 行译文')
+    if not run_command(tool, 'lj', f'{index.nickname} -l {lang} -f "{json_path}"', '写入译文'):
+        die('写入译文失败。')
+
+    trans, untrans = remaining_counts(tool, index, lang)
+    print()
+    info(f'写入后进度: 已翻译 {trans} 行, 未翻译 {untrans} 行')
+
+    banner('正在生成游戏可用的翻译文件')
+    info('(这一步会启动游戏一次，窗口弹出后会自动关闭)')
+    print()
+    if not run_command(tool, 'g', f'{index.nickname} -l {lang}', '生成翻译'):
+        die('生成翻译失败。')
+
+    banner('正在安装中文显示支持')
+    if not run_command(tool, 'ij', f'{index.nickname} -t I18n', '安装中文插件'):
+        print()
+        fail('中文插件没装上,译文可能显示为方块。')
+        print('         (译文本身已经装好了,不影响。)')
+    else:
+        print()
+        ok('中文插件已安装')
+
+    print()
+    banner('完成')
+    ok('译文已经装进游戏了')
+    print()
+    print('  进游戏后:按 Ctrl + I 打开语言菜单,选 "简体中文"。')
+    print('  如果游戏里没有反应,说明这个游戏需要手动加一个入口按钮,')
+    print('  让对话帮忙处理即可。')
+    if untrans:
+        print()
+        print(f'  还有 {untrans} 行没翻译。把游戏目录再拖一次 翻译.bat 重新导出。')
+    print()
+
+
+# ---------------------------------------------------------------- 入口
+
+def _print_usage():
+    print()
+    print('=' * 64)
+    print('  RenPy 游戏翻译 —— 拖拽工具包')
+    print('=' * 64)
+    print()
+    print('  把【游戏目录】拖到 翻译.bat 上')
+    print('      -> 导出全部未翻译文本')
+    print('      (拖游戏的 .exe 文件也行,效果一样)')
+    print()
+    print('  把【翻译好的 JSON 文件】拖到 翻译.bat 上')
+    print('      -> 把译文装回游戏')
+    print()
+    print('  游戏目录 = 能看到 exe 的那一层(里面还有 game、lib、renpy)')
+    print()
+    print('  给对话的翻译说明:同目录的 翻译提示词.md (发待翻译文件时一起发)')
+    print('  译文自检:python check_translation.py 原文.json 译文.json')
+    print()
+    print('  详细步骤见同目录的 使用说明.md')
+    print()
+
+
+def main():
+    if len(sys.argv) < 2:
+        _print_usage()
+        return 0
+
+    target = ' '.join(sys.argv[1:]).strip().strip('"').strip()
+    if not target:
+        _print_usage()
+        return 1
+    if not os.path.exists(target):
+        die(f'这个路径不存在: {target}',
+            '路径里有空格时请连同引号一起拖,或把文件复制到简单一点的路径再试。')
+
+    cfg = load_config()
+    enter_tool_dir(cfg)
+    tool = import_tool()
+
+    if os.path.isdir(target):
+        do_export(tool, cfg, validate_game_dir(target))
+    else:
+        if target.lower().endswith('.exe'):
+            # 拖的是游戏 exe 本身:它所在的目录就是游戏目录
+            info(f'拖的是 exe,按它所在的目录处理: {os.path.dirname(os.path.abspath(target))}')
+            do_export(tool, cfg, validate_game_dir(os.path.dirname(os.path.abspath(target))))
+        elif target.lower().endswith('.json'):
+            do_apply(tool, cfg, os.path.abspath(target))
+        else:
+            die(f'不认识这个文件类型: {os.path.basename(target)}',
+                '拖游戏目录(或游戏 exe)= 导出未翻译文本\n拖翻译好的 JSON = 装回游戏')
+
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print()
+        print('  已取消。')
+        sys.exit(130)
+    except Exception as e:
+        print()
+        fail(f'出了个意外错误: {e}')
+        print(traceback.format_exc())
+        sys.exit(1)
