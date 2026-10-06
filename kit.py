@@ -4,6 +4,7 @@
     kit.py <游戏目录>      -> 导出全部未翻译文本
     kit.py <JSON 文件>     -> 把译文装回游戏
 """
+import filecmp
 import json
 import os
 import re
@@ -154,6 +155,22 @@ def validate_game_dir(path):
 
 # ---------------------------------------------------------------- 解包检查与自动解包
 
+def rpa_entry_game_rel(entry):
+    """把 RPA 包内条目路径归一成「相对游戏根目录」的路径。
+
+    标准 Ren'Py 打包的条目自带 game/ 前缀;但也有游戏打包时不带
+    (条目形如 content/xxx.rpyc、script.rpyc)。引擎运行时把这些条目
+    当作 game/ 下的文件来加载,这里对齐同样的语义统一归入 game/ ——
+    否则脚本会被解到游戏根目录,游戏和导出流程都看不见那里。
+    """
+    entry = entry.replace('\\', '/').lstrip('/')
+    if not entry:
+        return entry
+    if entry.split('/', 1)[0].lower() == 'game':
+        return entry
+    return 'game/' + entry
+
+
 def find_rpa_files(game_dir):
     found = []
     for root, dirs, files in os.walk(game_dir):
@@ -189,7 +206,7 @@ def find_undecoded_rpyc(game_dir):
 
 
 def archive_missing_entries(archive, game_dir):
-    """列出压缩包里在游戏目录中还不存在的文件(相对游戏根目录)。"""
+    """列出压缩包里在游戏目录中还不存在的脚本文件(相对游戏根目录)。"""
     env = dict(os.environ)
     env['PYTHONPATH'] = VENDOR_DIR
     env['PYTHONIOENCODING'] = 'utf-8'
@@ -200,13 +217,14 @@ def archive_missing_entries(archive, game_dir):
         return None  # 读不了这个包,交给解包流程去报错
     entries = []
     for line in (p.stdout or '').splitlines():
-        line = line.strip().replace('/', os.sep)
+        line = line.strip()
         if not line or line.startswith(('Extracting', 'Archive', '--')):
             continue
         if not line.lower().endswith(('.rpy', '.rpyc', '.rpym', '.rpymc')):
             continue
-        if not os.path.exists(os.path.join(game_dir, line)):
-            entries.append(line)
+        rel = rpa_entry_game_rel(line).replace('/', os.sep)
+        if not os.path.exists(os.path.join(game_dir, rel)):
+            entries.append(rel)
     return entries
 
 
@@ -231,10 +249,14 @@ def check_unpacked(game_dir):
 
 
 def extract_rpa(archive, game_dir):
-    """解压到临时目录,只把缺失的脚本文件补进游戏目录(不覆盖、不解图片音频)。
+    """解压到临时目录,只把缺失的脚本文件补进 game/(不覆盖、不解图片音频)。
 
     游戏本身能直接读 .rpa 里的图片和音频,只有文本需要落成 .rpy 才扫得到;
     全量解压会让游戏体积翻倍,没必要。
+
+    不带 game/ 前缀的包内条目(非标准打包)按引擎语义归入 game/ 下;
+    旧版本会把这类条目错解到游戏根目录,这里顺手把逐字节相同的残留副本
+    清掉(内容不同的文件可能另有用处,一律保留)。
     """
     import tempfile
     tmp = tempfile.mkdtemp(prefix='kit_unrpa_')
@@ -248,20 +270,37 @@ def extract_rpa(archive, game_dir):
                            errors='replace', encoding='utf-8')
         out = (p.stdout or '') + (p.stderr or '')
 
-        copied = 0
+        copied = stale = 0
+        legacy_dirs = set()
         for root, dirs, files in os.walk(tmp):
             for f in files:
                 if not SCRIPT_EXTS_RE.search(f):
                     continue
                 src = os.path.join(root, f)
-                rel = os.path.relpath(src, tmp)
-                dst = os.path.join(game_dir, rel)
+                raw = os.path.relpath(src, tmp).replace(os.sep, '/')
+                rel = rpa_entry_game_rel(raw)
+                if rel != raw:
+                    legacy = os.path.join(game_dir, raw.replace('/', os.sep))
+                    if (os.path.isfile(legacy)
+                            and filecmp.cmp(legacy, src, shallow=False)):
+                        os.remove(legacy)
+                        stale += 1
+                        legacy_dirs.add(os.path.dirname(legacy))
+                dst = os.path.join(game_dir, rel.replace('/', os.sep))
                 if os.path.exists(dst):
                     continue  # 已存在的一律不动
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
                 copied += 1
-        return copied, out
+        # 清掉因删除残留而空出来的目录;非空目录 rmdir 会失败,正好当守护
+        for d in sorted(legacy_dirs, key=len, reverse=True):
+            while d and os.path.normcase(d) != os.path.normcase(game_dir):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
+                d = os.path.dirname(d)
+        return copied, stale, out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -274,18 +313,27 @@ def run_unrpyc(targets):
 
 
 def auto_unpack(game_dir, reason):
-    """自动解包:先解 rpa,再把 rpyc 反编译回 rpy。"""
+    """自动解包:先解 rpa,再把 rpyc 反编译回 rpy。
+
+    返回是否真的解出了新东西 —— 决定导出前要不要重新读取语言
+    (文本清单可能已经变大,旧的导入是残缺的)。
+    """
     banner('这个游戏还没解包，正在自动解包')
     info(f'原因: {reason}')
     print()
+    changed = False
 
     rpas = find_rpa_files(game_dir)
     if rpas:
         info(f'步骤 1/2  解开 {len(rpas)} 个 .rpa 压缩包')
         last_out = ''
+        total_stale = 0
         for i, rpa in enumerate(rpas, 1):
             print(f'         [{i}/{len(rpas)}] {os.path.basename(rpa)}')
-            _, last_out = extract_rpa(rpa, game_dir)
+            copied, stale, last_out = extract_rpa(rpa, game_dir)
+            total_stale += stale
+            if copied or stale:
+                changed = True
         # 解没解开不看返回值, 直接看包里的脚本还在不在游戏目录里
         still = [(r, archive_missing_entries(r, game_dir)) for r in rpas]
         still = [(r, m) for r, m in still if m]
@@ -296,6 +344,8 @@ def auto_unpack(game_dir, reason):
                 'https://github.com/VepsrP/UnRen-Gideon-mod-/releases\n'
                 '下载 UnRen-forall.bat 放进游戏目录,双击后按 回车 → 8 → 回车 → y')
         ok(f'{len(rpas)} 个压缩包已解开')
+        if total_stale:
+            ok(f'清理了 {total_stale} 个旧版本散落在游戏根目录的脚本副本')
 
     rpycs = find_undecoded_rpyc(game_dir)
     if rpycs:
@@ -310,9 +360,11 @@ def auto_unpack(game_dir, reason):
                 'https://github.com/VepsrP/UnRen-Gideon-mod-/releases\n'
                 '下载 UnRen-forall.bat 放进游戏目录,双击后按 回车 → 8 → 回车 → y')
         ok(f'{len(rpycs)} 个文件已还原')
+        changed = True
 
     print()
     ok('解包完成')
+    return changed
 
 
 # ---------------------------------------------------------------- 工作区
@@ -481,12 +533,26 @@ def do_export(tool, cfg, game_path):
     banner(f'导出未翻译文本: {os.path.basename(game_path)}')
 
     unpacked, reason = check_unpacked(game_path)
+    unpacked_now = False
     if not unpacked:
-        auto_unpack(game_path, reason)
+        unpacked_now = auto_unpack(game_path, reason)
     else:
         ok('游戏已解包')
 
     index = ensure_index(tool, cfg, game_path, ws)
+    if unpacked_now and index.exists_lang(lang):
+        # 解包补进了新的脚本,游戏可见的文本清单已经变大,
+        # 之前导入的语言是残缺的,必须重读一遍。
+        # (导入会清掉该语言的旧进度再重建;已翻译的内容仍留在
+        #  工作区「待翻译」目录里的 *_translated.json 中,可对照重贴。)
+        print()
+        info('这次解包让游戏多出了新的文本,正在重新读取一遍')
+        info('(这一步会启动游戏一次，窗口弹出后会自动关闭)')
+        print()
+        if not run_command(tool, 'i', f'{index.nickname} -l {lang}', '重新读取语言'):
+            die('重新读取语言失败。')
+        print()
+        ok('文本已重新读取')
     ensure_lang(tool, index, lang)
 
     trans, untrans = remaining_counts(tool, index, lang)
