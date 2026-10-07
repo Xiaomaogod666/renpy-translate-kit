@@ -70,6 +70,34 @@ init 900 python:
         )
 
         def _projz_apply_cn_font():
+            # 0. 官方字体替换映射: Ren'Py 渲染每个字体前都会查这张表
+            #    (renpy/text/font.py: font_replacement_map.get((fn, bold, italics)))。
+            #    screen 里、样式里、常量里写死的字体字面量一并覆盖,
+            #    这是唯一能治"输入框 font "fonts/camaro.ttf" 字面量"的手段。
+            def _map(fn):
+                try:
+                    for _b in (False, True):
+                        for _i in (False, True):
+                            renpy.config.font_replacement_map[(str(fn), _b, _i)] = (CN_FONT, _b, _i)
+                except Exception:
+                    pass
+
+            # 这个游戏已知写死的字体(不在的话映射了也无害)
+            for _fn in ("fonts/camaro.ttf", "fonts/quicksand.ttf",
+                        "fonts/familjen.ttf", "fonts/lemonmilk.otf"):
+                _map(_fn)
+
+            # 通用兜底: 扫游戏字体目录下真实存在的非中文字体全部映射
+            try:
+                for _dir in ("game/fonts/", "game/gui/fonts/"):
+                    _abs = os.path.join(renpy.config.gamedir, _dir)
+                    if os.path.isdir(_abs):
+                        for _f in os.listdir(_abs):
+                            if _f.lower().endswith((".ttf", ".otf")):
+                                _map(_dir + _f)
+            except Exception:
+                pass
+
             # 1. 字体常量重定义(只能影响此后新建的样式)
             for _name in _FONT_CONSTANTS:
                 if _name in globals():
@@ -90,6 +118,13 @@ init 900 python:
                 except Exception:
                     pass
 
+            # 4. 输入框等 screen 内嵌字体: font_replacement_map 已覆盖字面量,
+            #    这里再清一次文本布局缓存让替换立即生效
+            try:
+                renpy.text.font.font_cache.clear()
+            except Exception:
+                pass
+
         _projz_apply_cn_font()
 
         def _projz_font_on_lang_change(newlang, oldlang):
@@ -106,86 +141,198 @@ BRIDGE_PATCH = '''\
 # 对象显示。这条路径不经过 Ren'Py 的翻译管道(翻译查找只发生在编译好
 # 的 say 语句上), 所以 tl/ 里的翻译对它们无效, 游戏里仍旧显示英文。
 #
-# 本补丁包一层 Character 调用, 显示前查两级表:
-#   1. 字符串翻译表(strings, UI/字符串通道的译文);
-#   2. 对话译文表: 首次用到时从 translator.language_translates 里
-#      把 "原台词 -> 译文" 全量抽出来(数据驱动游戏的动态台词在导出时
-#      都以对话通道进过 tl/, 所以能对上)。
-# 两级都查不到的行原样显示, 不影响任何原有行为。
+# 挂点说明(踩过的坑, 别改回去):
+# - 不能挂 renpy.character.Character: 那是工厂函数, 不是对话类;
+# - ADVCharacter.__call__ 在部分游戏里也拦不到(对话可能不走全调用链);
+# - ADVCharacter.prefix_suffix 是 i18n 插件验证过的可靠卡口 --
+#   每次 say 的 who/what 都会经过它(thing == "what" 时 body 即台词),
+#   而且此时语言偏好已经就位。
+#
+# 查两级表: 字符串翻译表(strings) + 惰性构建的对话映射表
+# (原台词 -> 译文, 从 translator.language_translates 全量抽取)。
+# 都查不到的行原样显示, 不影响任何原有行为。
 #
 # 卸载: 把游戏目录拖到 去掉汉化.bat 即可(本文件会被一并移除)。
 #
 # 同字体补丁: 这里不要 "import renpy", 直接用预注入的 renpy 命名空间。
 
 init 901 python:
-    def _projz_bridge_make_wrapper(cls):
-        old_call = cls.__call__
+    # 对话译文表: {语言: (原文->译文, (who,原文)->译文)} —— 惰性构建
+    _bridge_dialogue_maps = {}
+    _bridge_dialogue_who_maps = {}
 
-        # 对话译文表: {语言: {(who or None, 原文): 译文}} —— 惰性构建
-        _dialogue_maps = {}
-        _dialogue_who_maps = {}
+    def _bridge_get_dialogue_map(lang):
+        if lang not in _bridge_dialogue_maps:
+            plain, whoed = {}, {}
+            try:
+                lt = renpy.game.script.translator.language_translates
+                dt = renpy.game.script.translator.default_translates
+                for (ident, l), node in lt.items():
+                    if l != lang:
+                        continue
+                    # 译文: TranslateSay 节点自身带 what; 普通翻译块
+                    # 的译文在 block 里的 Say 语句上
+                    new = None
+                    if getattr(node, "what", None):
+                        new = node.what
+                    else:
+                        for n in getattr(node, "block", []) or []:
+                            if getattr(n, "what", None):
+                                new = n.what
+                                break
+                    if not new:
+                        continue
+                    # 原文: 同 identifier 的默认(英文)节点
+                    orig = dt.get(ident)
+                    old = getattr(orig, "what", None)
+                    if not old or old == new:
+                        continue
+                    plain[old] = new
+                    whoed[(getattr(orig, "who", None), old)] = new
+            except Exception:
+                pass
+            _bridge_dialogue_maps[lang] = plain
+            _bridge_dialogue_who_maps[lang] = whoed
+        return _bridge_dialogue_maps[lang], _bridge_dialogue_who_maps[lang]
 
-        def _get_dialogue_map(lang):
-            if lang not in _dialogue_maps:
-                plain, whoed = {}, {}
-                try:
-                    lt = renpy.game.script.translator.language_translates
-                    dt = renpy.game.script.translator.default_translates
-                    for (ident, l), node in lt.items():
-                        if l != lang:
-                            continue
-                        # 译文: TranslateSay 节点自身带 what; 普通翻译块
-                        # 的译文在 block 里的 Say 语句上
-                        new = None
-                        if getattr(node, "what", None):
-                            new = node.what
-                        else:
-                            for n in getattr(node, "block", []) or []:
-                                if getattr(n, "what", None):
-                                    new = n.what
-                                    break
-                        if not new:
-                            continue
-                        # 原文: 同 identifier 的默认(英文)节点
-                        orig = dt.get(ident)
-                        old = getattr(orig, "what", None)
-                        if not old or old == new:
-                            continue
-                        plain[old] = new
-                        whoed[(getattr(orig, "who", None), old)] = new
-                except Exception:
-                    pass
-                _dialogue_maps[lang] = plain
-                _dialogue_who_maps[lang] = whoed
-            return _dialogue_maps[lang], _dialogue_who_maps[lang]
+    def _bridge_translate(what, who=None):
+        """把一句台词换成译文; 查不到原样返回。任何异常都不外抛。"""
+        try:
+            lang = renpy.game.preferences.language
+        except Exception:
+            lang = None
+        if not lang or not isinstance(what, str) or not what:
+            return what
+        try:
+            stl = renpy.game.script.translator.strings[lang]
+            new = stl.translate(what)
+            if new and new != what:
+                return new
+            plain, whoed = _bridge_get_dialogue_map(lang)
+            hit = whoed.get((who, what))
+            if hit is None:
+                hit = plain.get(what)
+            if hit:
+                return hit
+        except Exception:
+            pass
+        return what
 
-        def call(self, what, *args, **kwargs):
+    try:
+        _old_ps = renpy.character.ADVCharacter.prefix_suffix
+
+        def _bridge_prefix_suffix(self, thing, prefix, body, suffix):
+            if thing == "what" and isinstance(body, str) and body:
+                body = _bridge_translate(body, getattr(self, "name", None))
+            return _old_ps(self, thing, prefix, body, suffix)
+
+        renpy.character.ADVCharacter.prefix_suffix = _bridge_prefix_suffix
+    except Exception:
+        pass
+
+    try:
+        # 关键卡口: 台词常被写成 $ line = _("原文") 存变量, say 时传占位符
+        # [line_N]。_() 在赋值那一刻查表 —— 读档/切语言晚于赋值时变量里冻结
+        # 的还是英文。renpy.substitutions.substitute 先查表再插值, 对占位符
+        # 查不到任何东西; 包一层在插值【后】再查一次, 手里就是完整原句。
+        _old_sub = renpy.substitutions.substitute
+
+        def _bridge_substitute(s, scope=None, force=False, translate=True):
+            res = _old_sub(s, scope, force, translate)
+            try:
+                # 插值后手里是完整原句(占位符 [line_N] 展开成英文台词) ->
+                # 再查一次表, 治"变量冻结了切换前的语言"。
+                # 有没有 "[" 都要查: menu 选项 label 不带插值但也不过
+                # 翻译管道(menuexports 只 substitute 不查 strings 表),
+                # 按钮英文就是漏在这。
+                if (translate is not False and isinstance(res[0], str)
+                        and res[0] and res[0] != s):
+                    new = _bridge_translate(res[0])
+                    if new != res[0]:
+                        res = (new, res[1])
+            except Exception:
+                pass
+            return res
+
+        renpy.substitutions.substitute = _bridge_substitute
+    except Exception:
+        pass
+
+    try:
+        # menu 选项卡口: 选项 label 在 exports.menu 里只做本地 substitute
+        # (变量插值), 完全不查字符串翻译表 —— 按钮/选项英文漏在这。
+        # 只挂 exports.menu(AST 的唯一入口); 不能动 renpy.store.menu ——
+        # exports.menu 内部会以不同签名调它(ui.menu), 换掉会递归炸签名。
+        _old_menu = renpy.exports.menu
+
+        def _bridge_menu(items, *args, **kwargs):
+            try:
+                if items:
+                    fixed = []
+                    for it in items:
+                        if isinstance(it, tuple) and it and isinstance(it[0], str):
+                            label = _bridge_translate(it[0])
+                            if label != it[0]:
+                                it = (label,) + tuple(it[1:])
+                        fixed.append(it)
+                    items = fixed
+            except Exception:
+                pass
+            return _old_menu(items, *args, **kwargs)
+
+        renpy.exports.menu = _bridge_menu
+    except Exception:
+        pass
+
+    try:
+        # 终极卡口: 所有屏幕文本显示前必经 Text.set_text。
+        # 主题按钮(load 等)、交互动作(take a nap)、状态栏(week/time)这些
+        # 文本由 _() 在脚本求值时翻译 —— 求值早于切语言时结果被缓存进
+        # lambda/状态对象, 且显示路径不经过 substitute, 前面的卡口全
+        # 摸不到。在这层对最终显示文本查表, 全部兜住。
+        # (切语言后 per_interact 会用原始参数重跑 set_text, 本层自动
+        #  全屏重查一遍。i18n 插件的字体标签在 self.text 上后处理,
+        #  与本层只改传入文本互不干扰。)
+        _old_set_text = renpy.text.text.Text.set_text
+
+        def _bridge_set_text(self, text, scope=None, substitute=False, update=True):
             try:
                 lang = renpy.game.preferences.language
             except Exception:
                 lang = None
-            if lang and isinstance(what, str) and what:
+            if lang and isinstance(text, list):
                 try:
-                    stl = renpy.game.script.translator.strings[lang]
-                    new = stl.translate(what)
-                    if new and new != what:
-                        what = new
-                    else:
-                        plain, whoed = _get_dialogue_map(lang)
-                        hit = whoed.get((getattr(self, "name", None), what))
-                        if hit is None:
-                            hit = plain.get(what)
-                        if hit and hit != what:
-                            what = hit
+                    nt = []
+                    changed = False
+                    for i in text:
+                        if isinstance(i, str) and i:
+                            j = _bridge_translate(i)
+                            if j != i:
+                                i = j
+                                changed = True
+                        nt.append(i)
+                    if changed:
+                        text = nt
                 except Exception:
                     pass
-            return old_call(self, what, *args, **kwargs)
+            elif lang and isinstance(text, str) and text:
+                text = _bridge_translate(text)
+            return _old_set_text(self, text, scope, substitute, update)
 
-        return call
+        renpy.text.text.Text.set_text = _bridge_set_text
+    except Exception:
+        pass
 
     try:
-        _Character = renpy.character.Character
-        _Character.__call__ = _projz_bridge_make_wrapper(_Character)
+        # 双保险: 运行时直接调角色对象显示的路径
+        _cls = renpy.character.ADVCharacter
+        _old_call = _cls.__call__
+
+        def _bridge_call(self, what, *args, **kwargs):
+            what = _bridge_translate(what, getattr(self, "name", None))
+            return _old_call(self, what, *args, **kwargs)
+
+        _cls.__call__ = _bridge_call
     except Exception:
         pass
 '''
