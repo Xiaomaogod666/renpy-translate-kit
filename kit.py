@@ -19,6 +19,11 @@ UNREN = os.path.join(VENDOR_DIR, 'unren', 'unrpyc.py')
 
 SCRIPT_EXTS_RE = re.compile(r'\.(rpy|rpyc|rpym|rpymc)$', re.IGNORECASE)
 
+# 翻译 part 的命名法: <基础名>_<编号>_translated.json (基础名 = 游戏名_语言)
+PART_RE = re.compile(r'^(?P<root>.+)_(?P<num>\d+)_translated$', re.IGNORECASE)
+# 通用分块命名: part<编号>.json / part<编号>_<后缀>.json (翻译会话拆块常用)
+PART_FILE_RE = re.compile(r'^part(?P<num>\d+)(_\w+)?$', re.IGNORECASE)
+
 OK = '  [OK]   '
 NO = '  [失败] '
 GO = '  ...   '
@@ -631,12 +636,183 @@ def load_json_file(path):
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
     except Exception as e:
-        die(f'这个 JSON 读不了: {e}',
+        die(f'这个 JSON 读不了: {os.path.basename(path)} — {e}',
             '请确认拖进来的是一份翻译好的待翻译文件(JSON 格式)。')
     if not isinstance(data, dict) or not data:
-        die('这个 JSON 的内容不是预期的格式。',
+        die(f'{os.path.basename(path)} 的内容不是预期的格式。',
             '待翻译文件应该是一个 {编号: 原文} 的 JSON 对象。')
     return data
+
+
+def discover_part_queue(json_path):
+    """拖进来一个翻译好的 part 时, 把同目录里同批的其余 part 一起找出来。
+
+    认两种命名:
+    - 引擎导出命名:  <基础名>_<编号>_translated.json (基础名 = 游戏名_语言),
+      只组同一基础名下的编号;
+    - 通用分块命名:  part<编号>.json / part<编号>_<后缀>.json
+      (翻译会话把导出文件拆块翻时常用), 组同目录下所有 part 文件。
+    拖入的两者都不是(比如自己改过名)就不组队, 行为与从前一致。
+    返回按编号升序的路径列表, 一定包含拖入的那个文件。
+    """
+    path = os.path.abspath(json_path)
+    folder = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+
+    m = PART_RE.match(stem)
+    if m:
+        root = m.group('root').lower()
+
+        def match(s2):
+            m2 = PART_RE.match(s2)
+            return m2 if m2 and m2.group('root').lower() == root else None
+    elif PART_FILE_RE.match(stem):
+        def match(s2):
+            return PART_FILE_RE.match(s2)
+    else:
+        return [path]
+
+    found = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return [path]
+    for name in names:
+        if not name.lower().endswith('.json'):
+            continue
+        m2 = match(os.path.splitext(name)[0])
+        if m2:
+            found.setdefault((int(m2.group('num')), name.lower()),
+                             os.path.join(folder, name))
+    if not found:
+        return [path]
+    return [found[k] for k in sorted(found)]
+
+
+def same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def original_export_path(part_path):
+    """part 对应当初导出的原文文件(去掉 _translated 后缀); 不在就返回 None。"""
+    stem, ext = os.path.splitext(part_path)
+    if stem.lower().endswith('_translated'):
+        cand = stem[:-len('_translated')] + ext
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def check_part_fresh(index, lang, part_path):
+    """核对 part 的行号清单跟游戏当前文本是否还对得上。
+
+    tid 是按导入批次编的号, 重新读取过语言后旧文件的 tid 会指到别的行,
+    直接拖回来会把译文写到错误的行上。旁边还留着当初导出的原文文件时
+    可以逐行核对(已翻译的行核对不了也不需要 —— 装回去时引擎会自动丢弃);
+    核不出来就放行。返回问题说明, 没问题返回 None。
+    """
+    orig_file = original_export_path(part_path)
+    if orig_file is None:
+        return None
+    try:
+        with open(orig_file, encoding='utf-8') as f:
+            orig = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(orig, dict) or not orig:
+        return None
+    untranslated = dict(index.get_untranslated_lines(lang, say_only=False))
+    checked = bad = 0
+    for tid, orig_text in orig.items():
+        raw = untranslated.get(tid)
+        if raw is None:
+            continue  # 已翻译(或已不在清单里)的行不判, 装回去时本来就会丢弃
+        checked += 1
+        if raw != orig_text:
+            bad += 1
+    if checked and bad:
+        return f'{bad}/{checked} 行对不上(原文和游戏当前文本不一致)'
+    return None
+
+
+def do_apply(tool, cfg, json_path):
+    queue = discover_part_queue(json_path)
+    # 先把队列里所有文件都读一遍做校验: 有一个坏的就整体不写, 免得装一半
+    parts = [(p, load_json_file(p)) for p in queue]
+    dragged = next(d for p, d in parts if same_file(p, json_path))
+    game_path, manifest = locate_game_for_file(tool, cfg, json_path, dragged)
+    lang = manifest.get('lang') or cfg['target_language']
+
+    banner(f'装回游戏: {os.path.basename(game_path)}')
+    if len(parts) > 1:
+        ok(f'发现同批翻译 part 共 {len(parts)} 个, 自动组队一起装:')
+        for i, (p, d) in enumerate(parts, 1):
+            mark = '   <- 拖入的' if same_file(p, json_path) else ''
+            print(f'         [{i}/{len(parts)}] {os.path.basename(p)} ({len(d)} 行){mark}')
+
+    doc_id, index = find_index(tool, game_path)
+    if index is None:
+        die('这个游戏还没有翻译索引。',
+            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
+
+    ok(f'索引: {index.nickname}:{index.tag}   语言: {lang}')
+    if not index.exists_lang(lang):
+        die(f'索引里没有语言 "{lang}"。',
+            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
+
+    # 还原过的游戏会缺少支持脚本,先补上再写译文
+    ensure_base_injection(tool, index)
+
+    stale = [(p, msg) for p, _ in parts
+             if (msg := check_part_fresh(index, lang, p))]
+    if stale:
+        lines = ['这些文件的行号清单已经和游戏当前文本对不上(通常是游戏重新读取过文本):']
+        lines += [f'  {os.path.basename(p)}: {msg}' for p, msg in stale]
+        die('\n'.join(lines),
+            '旧文件的行号已失效, 拖回来会写到错误的行上。\n'
+            '请把游戏目录重新拖一次 翻译.bat 导出最新文本, 用新文件重新翻译。')
+
+    trans_before, _ = remaining_counts(tool, index, lang)
+    for i, (p, d) in enumerate(parts, 1):
+        print()
+        info(f'[{i}/{len(parts)}] 正在写入 {os.path.basename(p)} ({len(d)} 行)')
+        if not run_command(tool, 'lj', f'{index.nickname} -l {lang} -f "{p}"', '写入译文'):
+            die(f'写入译文失败: {os.path.basename(p)}',
+                '排在前面的 part 已经写入; 修好这个文件后重新拖任意一个 part 即可,\n'
+                '已写入的不受影响(装过的行引擎会自动跳过)。')
+    trans, untrans = remaining_counts(tool, index, lang)
+    print()
+    extra = f' (本次新增 {trans - trans_before} 行)' if len(parts) > 1 else ''
+    info(f'写入后进度: 已翻译 {trans} 行, 未翻译 {untrans} 行{extra}')
+
+    banner('正在生成游戏可用的翻译文件')
+    info('(这一步会启动游戏一次，窗口弹出后会自动关闭)')
+    print()
+    if not run_command(tool, 'g', f'{index.nickname} -l {lang}', '生成翻译'):
+        die('生成翻译失败。')
+
+    banner('正在安装中文显示支持')
+    if not run_command(tool, 'ij', f'{index.nickname} -t I18n', '安装中文插件'):
+        print()
+        fail('中文插件没装上,译文可能显示为方块。')
+        print('         (译文本身已经装好了,不影响。)')
+    else:
+        print()
+        ok('中文插件已安装')
+
+    print()
+    banner('完成')
+    ok('译文已经装进游戏了')
+    if len(parts) > 1:
+        ok(f'共装回 {len(parts)} 个翻译 part')
+    print()
+    print('  进游戏后:按 Ctrl + I 打开语言菜单,选 "简体中文"。')
+    print('  如果游戏里没有反应,说明这个游戏需要手动加一个入口按钮,')
+    print('  让对话帮忙处理即可。')
+    if untrans:
+        print()
+        print(f'  还有 {untrans} 行没翻译。把游戏目录再拖一次 翻译.bat 重新导出。')
+    print()
 
 
 def locate_game_for_file(tool, cfg, json_path, data):
@@ -682,63 +858,6 @@ def locate_game_for_file(tool, cfg, json_path, data):
         '或者确认这个游戏已经用本工具导出过一次。')
 
 
-def do_apply(tool, cfg, json_path):
-    data = load_json_file(json_path)
-    game_path, manifest = locate_game_for_file(tool, cfg, json_path, data)
-    lang = manifest.get('lang') or cfg['target_language']
-
-    banner(f'装回游戏: {os.path.basename(game_path)}')
-
-    doc_id, index = find_index(tool, game_path)
-    if index is None:
-        die('这个游戏还没有翻译索引。',
-            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
-
-    ok(f'索引: {index.nickname}:{index.tag}   语言: {lang}')
-    if not index.exists_lang(lang):
-        die(f'索引里没有语言 "{lang}"。',
-            '请先把游戏目录拖到 翻译.bat 上导出一次,再来回填译文。')
-
-    # 还原过的游戏会缺少支持脚本,先补上再写译文
-    ensure_base_injection(tool, index)
-
-    print()
-    info(f'正在写入 {len(data)} 行译文')
-    if not run_command(tool, 'lj', f'{index.nickname} -l {lang} -f "{json_path}"', '写入译文'):
-        die('写入译文失败。')
-
-    trans, untrans = remaining_counts(tool, index, lang)
-    print()
-    info(f'写入后进度: 已翻译 {trans} 行, 未翻译 {untrans} 行')
-
-    banner('正在生成游戏可用的翻译文件')
-    info('(这一步会启动游戏一次，窗口弹出后会自动关闭)')
-    print()
-    if not run_command(tool, 'g', f'{index.nickname} -l {lang}', '生成翻译'):
-        die('生成翻译失败。')
-
-    banner('正在安装中文显示支持')
-    if not run_command(tool, 'ij', f'{index.nickname} -t I18n', '安装中文插件'):
-        print()
-        fail('中文插件没装上,译文可能显示为方块。')
-        print('         (译文本身已经装好了,不影响。)')
-    else:
-        print()
-        ok('中文插件已安装')
-
-    print()
-    banner('完成')
-    ok('译文已经装进游戏了')
-    print()
-    print('  进游戏后:按 Ctrl + I 打开语言菜单,选 "简体中文"。')
-    print('  如果游戏里没有反应,说明这个游戏需要手动加一个入口按钮,')
-    print('  让对话帮忙处理即可。')
-    if untrans:
-        print()
-        print(f'  还有 {untrans} 行没翻译。把游戏目录再拖一次 翻译.bat 重新导出。')
-    print()
-
-
 # ---------------------------------------------------------------- 入口
 
 def _print_usage():
@@ -753,6 +872,7 @@ def _print_usage():
     print()
     print('  把【翻译好的 JSON 文件】拖到 翻译.bat 上')
     print('      -> 把译文装回游戏')
+    print('      (同目录里同批的其他 part 会自动组队, 一次全部装回)')
     print()
     print('  游戏目录 = 能看到 exe 的那一层(里面还有 game、lib、renpy)')
     print()

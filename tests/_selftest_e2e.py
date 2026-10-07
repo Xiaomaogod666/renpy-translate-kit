@@ -216,6 +216,89 @@ with open(out6, encoding='utf-8') as f:
     data6 = json.load(f)
 check('--limit 150 只导出 150 行', len(data6), 150)
 
+print()
+print('=== 13. 拖一个 part 自动组队装回(走 kit.do_apply) ===')
+# 库里还有 250 行未翻的 Big; 补 6 行新的, 限行导出这 6 行, 切成 3 个 part
+M2 = 6
+small = []
+for i in range(M2):
+    small.append({'type': 'renpy.ast.Say', 'what': f'Tiny {i}', 'code': f'    e "Tiny {i}"',
+                  'new_code': None})
+with TranslationDao(db_file) as dao:
+    dao.add_batch(f'D{lang}', [{'block': small}])
+index.update_translation_stats(lang)
+_, base_untrans = kit.remaining_counts(tool_handle, index, lang)
+check('补 6 行后未翻 406 (400 大批次 + 6 新行)', base_untrans, 406)
+
+parts_dir = os.path.join(BASE, 'parts')
+os.makedirs(parts_dir, exist_ok=True)
+# 导出文件名故意就叫 <root>_101.json —— 它本身就是 101 part 的原文文件
+out7 = os.path.join(parts_dir, 'TestGame_schinese_101.json')
+manage.execute_cmd('sj', kit.build_export_args(nick, lang, out7, M2))
+with open(out7, encoding='utf-8') as f:
+    data7 = json.load(f)
+check('限行导出 6 行', len(data7), 6)
+
+# 切成 3 个 part: 101 自带原文文件(新鲜度核对应通过), 102/103 不带; 拖中间的 102
+items7 = list(data7.items())
+for no, chunk in (('101', items7[0:2]), ('102', items7[2:4]), ('103', items7[4:6])):
+    with open(os.path.join(parts_dir, f'TestGame_schinese_{no}_translated.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({t: f'【队】{v}' for t, v in chunk}, f, ensure_ascii=False, indent=2)
+
+calls = []
+_real_rc = kit.run_command
+def fake_rc(tool, cmd, args, what):
+    calls.append(cmd)
+    if cmd in ('g', 'ij'):
+        print(f'  [stub] {what}')
+        return True
+    return _real_rc(tool, cmd, args, what)
+kit.run_command = fake_rc
+try:
+    kit.do_apply(tool_handle, kit.load_config(),
+                 os.path.join(parts_dir, 'TestGame_schinese_102_translated.json'))
+finally:
+    kit.run_command = _real_rc
+
+check('组队 3 个 part, 逐个 lj', calls.count('lj'), 3)
+check('生成只跑一次', calls.count('g'), 1)
+check('中文插件只装一次', calls.count('ij'), 1)
+_, after_queue = kit.remaining_counts(tool_handle, index, lang)
+check('6 行全部写入', after_queue, base_untrans - M2)
+
+print()
+print('=== 14. 行号失效的 part 必须整体拒绝(一个都不写) ===')
+_, untrans_before = kit.remaining_counts(tool_handle, index, lang)
+# 挑一个"当前仍未翻译"的行来伪造失效: 原文文件里给的原文和库里对不上
+bad_tid, bad_raw = index.get_untranslated_lines(lang, say_only=True)[0]
+bad_orig = os.path.join(parts_dir, 'TestGame_schinese_201.json')
+bad_part = os.path.join(parts_dir, 'TestGame_schinese_201_translated.json')
+with open(bad_orig, 'w', encoding='utf-8') as f:
+    json.dump({bad_tid: '故意写错的原文'}, f, ensure_ascii=False)
+with open(bad_part, 'w', encoding='utf-8') as f:
+    json.dump({bad_tid: '【坏】译文'}, f, ensure_ascii=False)
+
+calls2 = []
+def fake_rc2(tool, cmd, args, what):
+    calls2.append(cmd)
+    if cmd in ('g', 'ij'):
+        return True
+    return _real_rc(tool, cmd, args, what)
+kit.run_command = fake_rc2
+rejected = False
+try:
+    try:
+        kit.do_apply(tool_handle, kit.load_config(), bad_part)
+    except SystemExit:
+        rejected = True
+finally:
+    kit.run_command = _real_rc
+check('失效 part 被拒绝(退出)', rejected, True)
+check('拒绝发生在写入之前', calls2.count('lj'), 0)
+_, untrans_after = kit.remaining_counts(tool_handle, index, lang)
+check('没有写入任何行', untrans_after, untrans_before)
+
 # 收尾: 关掉缓存的 db 句柄, 否则文件被占用删不掉
 from store.database.base import _clear_dbs  # noqa: E402
 _clear_dbs()

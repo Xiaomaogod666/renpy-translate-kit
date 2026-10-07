@@ -173,5 +173,66 @@ check('同一路径结果稳定', kit.make_nickname(r'C:/x/我的游戏A'), n1)
 check('索引名不比原名长', len(n1) <= 32, True)
 
 print()
+print('=== 7. 翻译 part 组队发现 ===')
+P = F('parts')
+os.makedirs(P, exist_ok=True)
+def mk(name, content='{}'):
+    with open(os.path.join(P, name), 'w', encoding='utf-8') as f:
+        f.write(content)
+mk('GameA_schinese_001_translated.json')
+mk('GameA_schinese_002_translated.json')
+mk('GameA_schinese_010_translated.json')
+mk('GameA_schinese_003_TRANSLATED.JSON')   # 大写后缀也要认
+mk('GameA_schinese_002.json')              # 原文文件, 不入队
+mk('GameB_schinese_001_translated.json')   # 别的游戏, 不入队
+mk('random.json')                          # 无关文件
+mk('GameA_schinese_004_translated.txt')    # 扩展名不对, 不入队
+
+q = kit.discover_part_queue(os.path.join(P, 'GameA_schinese_002_translated.json'))
+check('拖 002 -> 组齐 001/002/003/010',
+      [os.path.basename(x) for x in q],
+      ['GameA_schinese_001_translated.json',
+       'GameA_schinese_002_translated.json',
+       'GameA_schinese_003_TRANSLATED.JSON',
+       'GameA_schinese_010_translated.json'])
+check('编号按数字排序(10 排在 3 后面)', os.path.basename(q[-1]),
+      'GameA_schinese_010_translated.json')
+q = kit.discover_part_queue(os.path.join(P, 'GameA_schinese_002.json'))
+check('拖原文文件(无 _translated)不组队', len(q), 1)
+q = kit.discover_part_queue(os.path.join(P, 'random.json'))
+check('拖改名过的文件不组队', len(q), 1)
+q = kit.discover_part_queue(os.path.join(P, 'GameB_schinese_001_translated.json'))
+check('别的前缀不混入', [os.path.basename(x) for x in q],
+      ['GameB_schinese_001_translated.json'])
+
+print()
+print('=== 8. 通用分块命名(part<编号>)组队 ===')
+P2 = F('parts2')
+os.makedirs(P2, exist_ok=True)
+def mk2(name, content='{}'):
+    with open(os.path.join(P2, name), 'w', encoding='utf-8') as f:
+        f.write(content)
+mk2('part01.json')
+mk2('part02.json')
+mk2('part10.json')
+mk2('part00_reused.json')      # 带后缀的也算
+mk2('part03_TRANSLATED.JSON')  # 大写也算
+mk2('parts.json')              # part 后面不是数字, 不算
+mk2('partial.json')            # 同上
+mk2('Part07.json')             # 大写 part 也算
+mk2('other.json')              # 无关文件
+
+q = kit.discover_part_queue(os.path.join(P2, 'part05.json'))
+check('part05 不在也不影响, 组齐全部 part 文件',
+      [os.path.basename(x) for x in q],
+      ['part00_reused.json', 'part01.json', 'part02.json',
+       'part03_TRANSLATED.JSON', 'Part07.json', 'part10.json'])
+check('按编号排序(00 在最前, 10 在最后)', os.path.basename(q[-1]), 'part10.json')
+q = kit.discover_part_queue(os.path.join(P2, 'other.json'))
+check('拖无关文件不组队', len(q), 1)
+q = kit.discover_part_queue(os.path.join(P2, 'parts.json'))
+check('part 后面不是数字不算 part', len(q), 1)
+
+print()
 print('总计: %d/%d 通过' % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)
