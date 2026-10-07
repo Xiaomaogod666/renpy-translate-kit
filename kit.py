@@ -489,8 +489,24 @@ def ensure_lang(tool, index, lang):
     ok(f'语言 "{lang}" 已就绪')
 
 
+# 进度统计口径: 剥掉这些 token 之后还剩文字的行才算「需要翻译」。
+# 引擎扫描入库的条目里混着大量无需翻译的东西 —— 纯变量引用([line_1])、
+# 富文本标签({#xxx})、占位符(%(name)s)、纯符号数字('...'、'?!')。
+# 它们永远不会被导出(引擎导出时同样会过滤), 算进"没翻译"只会吓人。
+NOT_TEXT_RE = re.compile(r'\{[^}]*\}|\[[^\]]*\]|%\(.*?\)[sdifx]|%[sdifx]')
+
+
+def _is_meaningless_text(text):
+    """剥掉变量/标签/占位符后没有(或只剩符号数字)正文 -> 无需翻译。"""
+    t = NOT_TEXT_RE.sub('', str(text)).strip()
+    return (not t) or re.fullmatch(r'[\W_0-9]+', t) is not None
+
+
 def remaining_counts(tool, index, lang):
-    """返回 (已翻译, 未翻译)。
+    """返回 (已翻译, 未翻译), 只统计确实有文字要翻的行。
+
+    数据库里躺着大量引擎扫进来但无需翻译的条目(纯变量引用、纯符号数字),
+    这里把它们剔除 —— 否则"还有 N 行没翻译"会虚高一大截。
 
     每次都从数据库重新取,因为写译文(lj)之后 stats 已经被更新到 DB,
     而手里这个 index 对象还是旧的,直接读它会报出过期的进度。
@@ -501,13 +517,14 @@ def remaining_counts(tool, index, lang):
             doc_id=index.doc_id, nickname=index.nickname)
     except Exception:
         fresh = None
-    stats = (fresh or index).translation_state
+    idx = fresh or index
     trans = untrans = 0
-    for kind in ('dialogue', 'string'):
-        entry = stats.get(kind, {}).get(lang)
-        if entry:
-            trans += entry[0]
-            untrans += entry[1]
+    for _, text in idx.get_untranslated_lines(lang, say_only=True):
+        if not _is_meaningless_text(text):
+            untrans += 1
+    for _, text in idx.get_translated_lines(lang, say_only=True):
+        if not _is_meaningless_text(text):
+            trans += 1
     return trans, untrans
 
 

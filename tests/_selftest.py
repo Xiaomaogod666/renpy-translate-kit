@@ -234,5 +234,15 @@ q = kit.discover_part_queue(os.path.join(P2, 'parts.json'))
 check('part 后面不是数字不算 part', len(q), 1)
 
 print()
+print('=== 9. 进度统计口径: 无需翻译的行不算"没翻译" ===')
+for bad in ('[line_1]', '[_kiss_result_text]', '{#character_name}',
+            '%(name)s', '%s', '...', '……', '123', '?!', '「」', '', '   ',
+            '[time_locked_text]'):
+    check(f'无需翻译: {bad!r}', kit._is_meaningless_text(bad), True)
+for good in ('闻着真香。', 'Mia', 'Founders Way', 'OK!!!',
+             '[time] minutes left', 'Eggs and toast. Don\'t get used to it.'):
+    check(f'需要翻译: {good!r}', kit._is_meaningless_text(good), False)
+
+print()
 print('总计: %d/%d 通过' % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

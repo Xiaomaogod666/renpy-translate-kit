@@ -299,6 +299,24 @@ check('拒绝发生在写入之前', calls2.count('lj'), 0)
 _, untrans_after = kit.remaining_counts(tool_handle, index, lang)
 check('没有写入任何行', untrans_after, untrans_before)
 
+print()
+print('=== 15. 进度统计: 纯变量/符号行不算"没翻译" ===')
+trans0, untrans0 = kit.remaining_counts(tool_handle, index, lang)
+with TranslationDao(db_file) as dao:
+    dao.add_batch(f'D{lang}', [{'block': [
+        {'type': 'renpy.ast.Say', 'what': '[pure_var_line]',
+         'code': '    e "[pure_var_line]"', 'new_code': None},
+    ]}])
+    dao.add_batch(f'S{lang}', [{'block': [
+        {'type': 'String', 'what': '...', 'code': None, 'parsed': [], 'new_code': None},
+        {'type': 'String', 'what': '垃圾之外的一行真文本', 'code': None,
+         'parsed': [], 'new_code': None},
+    ]}])
+index.update_translation_stats(lang)
+trans1, untrans1 = kit.remaining_counts(tool_handle, index, lang)
+check('纯变量/符号行没有计入未翻(只有真文本 +1)', untrans1, untrans0 + 1)
+check('已翻计数不受垃圾行影响', trans1, trans0)
+
 # 收尾: 关掉缓存的 db 句柄, 否则文件被占用删不掉
 from store.database.base import _clear_dbs  # noqa: E402
 _clear_dbs()
