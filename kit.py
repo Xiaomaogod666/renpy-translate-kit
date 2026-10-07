@@ -14,8 +14,11 @@ import sys
 import traceback
 
 KIT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, KIT_DIR)
 VENDOR_DIR = os.path.join(KIT_DIR, 'vendor')
 UNREN = os.path.join(VENDOR_DIR, 'unren', 'unrpyc.py')
+
+import game_patches  # noqa: E402  游戏侧中文显示补丁(字体兜底 + 运行时翻译桥)
 
 SCRIPT_EXTS_RE = re.compile(r'\.(rpy|rpyc|rpym|rpymc)$', re.IGNORECASE)
 
@@ -816,6 +819,15 @@ def do_apply(tool, cfg, json_path):
     else:
         print()
         ok('中文插件已安装')
+        # 游戏侧显示补丁: 字体兜底(防方块) + 运行时翻译桥(让数据驱动
+        # 型游戏的动态对话也走翻译)。缺哪个文件游戏都会自动跳过。
+        try:
+            patched = game_patches.write_display_patches(game_path)
+            if patched:
+                ok('已安装中文显示补丁: ' + ', '.join(
+                    os.path.basename(p) for p in patched))
+        except Exception as e:
+            fail(f'中文显示补丁写入失败(不影响译文): {e}')
 
     print()
     banner('完成')

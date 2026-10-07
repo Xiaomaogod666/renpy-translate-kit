@@ -87,6 +87,11 @@ w(path('game/projz_injection.rpy'), BANNER + 'init python: pass\n')
 wb(path('game/projz_injection.rpyc'), b'\x00inj\x00')
 w(path('game/projz_i18n_inject.rpy'), BANNER + 'define projz_font_dir = "projz_fonts/"\n')
 wb(path('game/projz_i18n_inject.rpyc'), b'\x00i18n\x00')
+# 中文显示补丁(字体兜底 + 运行时桥) —— 也属于注入产物, 必须一并清除
+w(path('game/zzz_cn_font_patch.rpy'), BANNER + 'init 900 python: pass\n')
+wb(path('game/zzz_cn_font_patch.rpyc'), b'\x00fontp\x00')
+w(path('game/zzz_cn_runtime_bridge.rpy'), BANNER + 'init 901 python: pass\n')
+wb(path('game/zzz_cn_runtime_bridge.rpyc'), b'\x00bridge\x00')
 wb(path('game/projz_fonts/SourceHanSansLite.ttf'), b'\x00\x01\x00\x00fake-font' * 10)
 
 # 游戏自己的脚本 + 存档 + 运行时缓存
@@ -141,6 +146,12 @@ check('我们的译文已删除', os.path.exists(path('game/tl/schinese')), Fals
 check('注入文件已删除', os.path.exists(path('game/projz_injection.rpy')), False)
 check('注入 .rpyc 已删除', os.path.exists(path('game/projz_injection.rpyc')), False)
 check('i18n 注入已删除', os.path.exists(path('game/projz_i18n_inject.rpy')), False)
+check('字体补丁已删除', os.path.exists(path('game/zzz_cn_font_patch.rpy')), False)
+check('字体补丁 .rpyc 已删除',
+      os.path.exists(path('game/zzz_cn_font_patch.rpyc')), False)
+check('运行时桥已删除', os.path.exists(path('game/zzz_cn_runtime_bridge.rpy')), False)
+check('运行时桥 .rpyc 已删除',
+      os.path.exists(path('game/zzz_cn_runtime_bridge.rpyc')), False)
 check('字体目录已删除', os.path.exists(path('game/projz_fonts')), False)
 check('旧 screens.rpyc 已删除', os.path.exists(path('game/screens.rpyc')), False)
 check('运行时缓存已删除', os.path.exists(path('game/cache/bytecode.rpyb')), False)

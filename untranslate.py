@@ -28,7 +28,8 @@ BUTTON_RE = re.compile(
     r'^\s*textbutton _\("I18n settings"\) action Show\("projz_i18n_settings"\)\s*$')
 
 # 注入文件本体（写基名，脚本自己补 .rpy/.rpyc）
-PROJZ_FILES = ('projz_injection', 'projz_i18n_inject')
+PROJZ_FILES = ('projz_injection', 'projz_i18n_inject',
+               'zzz_cn_font_patch', 'zzz_cn_runtime_bridge')
 FONT_DIR = 'projz_fonts'
 # 运行时缓存，游戏自己会重建；只删这几个，不动 cache 里别的东西
 CACHE_FILES = ('bytecode.rpyb', 'pyanalysis.rpyb', 'screens.rpyb')
