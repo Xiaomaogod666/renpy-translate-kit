@@ -157,13 +157,16 @@ BRIDGE_PATCH = '''\
 # 同字体补丁: 这里不要 "import renpy", 直接用预注入的 renpy 命名空间。
 
 init 901 python:
-    # 对话译文表: {语言: (原文->译文, (who,原文)->译文)} —— 惰性构建
+    # 对话译文表: {语言: (原文->译文, (who,原文)->译文, 小写原文->译文)}
+    # 第三套索引: 游戏常用 .lower() 把按钮文本转小写再显示(键变大写小
+    # 混杂原文后与翻译表对不上), 用小写键兜底。
     _bridge_dialogue_maps = {}
     _bridge_dialogue_who_maps = {}
+    _bridge_dialogue_lower_maps = {}
 
     def _bridge_get_dialogue_map(lang):
         if lang not in _bridge_dialogue_maps:
-            plain, whoed = {}, {}
+            plain, whoed, lowered = {}, {}, {}
             try:
                 lt = renpy.game.script.translator.language_translates
                 dt = renpy.game.script.translator.default_translates
@@ -189,11 +192,33 @@ init 901 python:
                         continue
                     plain[old] = new
                     whoed[(getattr(orig, "who", None), old)] = new
+                    lowered[old.lower()] = new
             except Exception:
                 pass
             _bridge_dialogue_maps[lang] = plain
             _bridge_dialogue_who_maps[lang] = whoed
-        return _bridge_dialogue_maps[lang], _bridge_dialogue_who_maps[lang]
+            _bridge_dialogue_lower_maps[lang] = lowered
+        return (_bridge_dialogue_maps[lang], _bridge_dialogue_who_maps[lang],
+                _bridge_dialogue_lower_maps[lang])
+
+    # 小写字符串索引: 游戏常把按钮文本 .lower() 后再显示(Take a nap ->
+    # take a nap), 且部分标题在 init 期(语言未应用时)求值后缓存进动作
+    # 列表 —— 显示时的文本与字符串表的键大小写对不上。用表的小写键兜底。
+    _bridge_strings_lower = {}
+
+    def _bridge_get_strings_lower(lang):
+        if lang not in _bridge_strings_lower:
+            idx = {}
+            try:
+                for k, v in renpy.game.script.translator.strings[lang].translations.items():
+                    try:
+                        idx.setdefault(str(k).lower(), v)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _bridge_strings_lower[lang] = idx
+        return _bridge_strings_lower[lang]
 
     def _bridge_translate(what, who=None):
         """把一句台词换成译文; 查不到原样返回。任何异常都不外抛。"""
@@ -208,10 +233,19 @@ init 901 python:
             new = stl.translate(what)
             if new and new != what:
                 return new
-            plain, whoed = _bridge_get_dialogue_map(lang)
+            # .lower() 过的文本: 大小写对不上精确键, 用小写索引兜底。
+            # 注意文本可能【本来就是全小写】(游戏已 .lower() 过) ——
+            # 这时 what.lower() == what, 也必须查, 不能跳过。
+            hit = _bridge_get_strings_lower(lang).get(what.lower())
+            if hit:
+                return hit
+            plain, whoed, lowered = _bridge_get_dialogue_map(lang)
             hit = whoed.get((who, what))
             if hit is None:
                 hit = plain.get(what)
+            if hit is None:
+                # .lower() 后的文本(小写化按钮标签)按小写键兜底
+                hit = lowered.get(what.lower())
             if hit:
                 return hit
         except Exception:
